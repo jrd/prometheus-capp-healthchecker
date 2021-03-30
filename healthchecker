@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+from docker import from_env
+from prometheus_client import start_http_server, Enum
+from signal import signal, SIGTERM
+from sys import exit
+
+
+class ContainersEvents:
+    UNKNOWN = 'none'
+    CREATED_STATE = 'created'
+    RUNNING_STATE = 'running'
+    PAUSED_STATE = 'paused'
+    RESTARTING_STATE = 'restarting'
+    EXITED_STATE = 'exited'
+    CRASHED_STATE = 'exited-crashed'
+    STOPPING_STATE = 'stopping'
+    DEAD_STATE = 'dead'
+    STATUS_STATES = [CREATED_STATE, RUNNING_STATE, PAUSED_STATE, RESTARTING_STATE, EXITED_STATE, CRASHED_STATE, STOPPING_STATE, DEAD_STATE]
+    HEALTH_STATUS = 'health_status'
+    HEALTHY = 'healthy'
+    UNHEALTHY = 'unhealthy'
+    HEALTH_STATES = [UNKNOWN, HEALTHY, UNHEALTHY]
+    # dictionnary of docker events and status returned.
+    # for health status, the value is the health status.
+    DOCKER_EVENTS = {
+        'create': CREATED_STATE,  # 5
+        'start': RUNNING_STATE,  # 7
+        'pause': PAUSED_STATE,  # 6
+        'unpause': RUNNING_STATE,  # 7
+        'restart': RESTARTING_STATE,  # 4
+        'die': EXITED_STATE,  # 2
+        'stop': STOPPING_STATE,  # 1
+        'destroy': DEAD_STATE,  # 0
+        f'{HEALTH_STATUS}: starting': UNKNOWN,  # 0
+        f'{HEALTH_STATUS}: unhealthy': UNHEALTHY,  # 1
+        f'{HEALTH_STATUS}: healthy': HEALTHY,  # 2
+    }
+    LABELS = ('capp.app', 'capp.environment')
+
+    def __init__(self):
+        self.containers_info = {}
+        self.status_enum = Enum(
+            'container_status_enum',
+            'Container status',
+            states=self.STATUS_STATES,
+            labelnames=['name'] + [f"container_label_{label.replace('.', '_')}" for label in self.LABELS],
+        )
+        self.health_enum = Enum(
+            'container_health_enum',
+            'Container health',
+            states=self.HEALTH_STATES,
+            labelnames=['name'] + [f"container_label_{label.replace('.', '_')}" for label in self.LABELS],
+        )
+        self.client = from_env()
+
+    def get_info(self, container_id):
+        if container_id in self.containers_info:
+            info = self.containers_info[container_id]
+        else:
+            info = {'state': self.UNKNOWN, 'health': self.UNKNOWN, 'name': self.UNKNOWN, 'labels': {}}
+            self.containers_info[container_id] = info
+        return info
+
+    def adjust_state(self, info, exit_code):
+        if info['state'] == self.EXITED_STATE and int(exit_code):
+            info['state'] = self.CRASHED_STATE
+
+    def send_info(self, container_id):
+        info = self.containers_info[container_id]
+        labels = {f"container_label_{label.replace('.', '_')}": info['labels'].get(label, self.UNKNOWN) for label in self.LABELS}
+        if info['state'] == self.DEAD_STATE:
+            del self.containers_info[container_id]
+        if info['state'] != self.RUNNING_STATE:
+            # previous health status is irrelevant if not running
+            info['health'] = self.UNKNOWN
+        if info['state'] != self.UNKNOWN:
+            self.status_enum.labels(name=info['name'], **labels).state(info['state'])
+        self.health_enum.labels(name=info['name'], **labels).state(info['health'])
+
+    def poll_containers(self):
+        for container in self.client.containers.list(all=True, ignore_removed=True):
+            info = self.get_info(container.id)
+            info['state'] = container.status
+            info['name'] = container.name
+            info['labels'] = container.labels
+            self.adjust_state(info, container.attrs.get('State', {}).get('ExitCode', 0))
+            if 'Health' in container.attrs.get('State', {}):
+                info['health'] = self.DOCKER_EVENTS.get(f"{self.HEALTH_STATUS}: {container.attrs['State']['Health']['Status']}", self.UNKNOWN)
+            self.send_info(container.id)
+
+    def listen_docker_events_loop(self):
+        for event in self.client.events(filters={'type': 'container'}, decode=True):
+            container_id = event['id']
+            info = self.get_info(container_id)
+            docker_status = event['status']
+            if docker_status in self.DOCKER_EVENTS:
+                if docker_status.startswith(self.HEALTH_STATUS):
+                    info['health'] = self.DOCKER_EVENTS[docker_status]
+                else:
+                    info['state'] = self.DOCKER_EVENTS[docker_status]
+                    self.adjust_state(info, event.get('Actor', {}).get('Attributes', {}).get('exitCode', 0))
+                info['name'] = event.get('Actor', {}).get('Attributes', {}).get('name', container_id)
+                info['labels'] = {att: value for att, value in event.get('Actor', {}).get('Attributes', {}).items() if '.' in att or '_' in att}
+                self.send_info(container_id)
+
+
+def sigterm_handler(_signum, _frame):
+    exit()
+
+
+if __name__ == '__main__':
+    start_http_server(80)
+    ce = ContainersEvents()
+    ce.poll_containers()
+    print("healthchecker started")
+    signal(SIGTERM, sigterm_handler)
+    try:
+        ce.listen_docker_events_loop()
+    finally:
+        print("healthchecker terminated")
